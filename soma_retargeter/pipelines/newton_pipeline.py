@@ -16,6 +16,7 @@ from soma_retargeter.animation.skeleton import Skeleton, SkeletonInstance
 from soma_retargeter.animation.animation_buffer import AnimationBuffer
 from soma_retargeter.robotics.human_to_robot_scaler import HumanToRobotScaler
 from soma_retargeter.robotics.csv_animation_buffer import CSVAnimationBuffer
+from soma_retargeter.robotics.robot_loader import create_robot_builder
 from soma_retargeter.pipelines.feet_stabilizer import FeetStabilizer
 from soma_retargeter.pipelines.joint_limit_clamper import JointLimitClamper
 
@@ -24,6 +25,56 @@ _DEFAULT_JOINT_LIMIT_OBJECTIVE_WEIGHT = 10.0
 _DEFAULT_SMOOTH_JOINT_FILTER_OBJECTIVE_WEIGHT = 5.5
 _DEFAULT_NUM_INITIALIZATION_FRAMES = 10
 _DEFAULT_NUM_STABILIZATION_FRAMES = 5
+_DEFAULT_OUTPUT_SMOOTHING_WINDOW = 1
+
+
+def _normalized_quat_np(quat):
+    norm = np.linalg.norm(quat)
+    if norm < 1e-8:
+        return np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+    return (quat / norm).astype(np.float32)
+
+
+def _smooth_motion_data(motion_data: np.ndarray, window: int) -> np.ndarray:
+    if window <= 1 or motion_data.shape[0] < 3:
+        return motion_data
+
+    window = min(window, motion_data.shape[0])
+    if window % 2 == 0:
+        window -= 1
+    if window <= 1:
+        return motion_data
+
+    radius = window // 2
+    ramp = np.arange(1, radius + 2, dtype=np.float32)
+    weights = np.concatenate([ramp, ramp[-2::-1]])
+    weights /= np.sum(weights)
+
+    smoothed = motion_data.copy()
+
+    for start, end in ((0, 3), (7, motion_data.shape[1])):
+        padded = np.pad(motion_data[:, start:end], ((radius, radius), (0, 0)), mode="edge")
+        smoothed[:, start:end] = np.stack(
+            [
+                np.tensordot(weights, padded[i:i + window], axes=(0, 0))
+                for i in range(motion_data.shape[0])
+            ]
+        )
+
+    quats = motion_data[:, 3:7].copy()
+    for i in range(1, quats.shape[0]):
+        if np.dot(quats[i - 1], quats[i]) < 0.0:
+            quats[i] *= -1.0
+
+    padded_quats = np.pad(quats, ((radius, radius), (0, 0)), mode="edge")
+    smoothed[:, 3:7] = np.stack(
+        [
+            _normalized_quat_np(np.tensordot(weights, padded_quats[i:i + window], axes=(0, 0)))
+            for i in range(motion_data.shape[0])
+        ]
+    )
+
+    return smoothed
 
 
 class NewtonPipeline:
@@ -64,16 +115,16 @@ class NewtonPipeline:
         self.ik_iterations = retargeter_config.get('ik_iterations', _DEFAULT_IK_SOLVER_ITERATIONS)
         self.joint_limit_weight = retargeter_config.get('joint_limit_weight', _DEFAULT_JOINT_LIMIT_OBJECTIVE_WEIGHT)
         self.smooth_joint_filter_weight = retargeter_config.get('smooth_joint_filter_weight', _DEFAULT_SMOOTH_JOINT_FILTER_OBJECTIVE_WEIGHT)
+        self.output_smoothing_window = int(retargeter_config.get('output_smoothing_window', _DEFAULT_OUTPUT_SMOOTHING_WINDOW))
         self.post_processing_enabled = retargeter_config.get('enable_post_processing', True)
         self.enable_self_penetration = False
         self.smooth_joint_filter_coord_masks = None
         self.joint_limit_clamper = None
 
-        if (self.target_type == pipeline_utils.TargetType.UNITREE_G1):
-            self.robot_builder = newton.ModelBuilder()
-            self.robot_builder.add_mjcf(
-                newton.utils.download_asset("unitree_g1") / "mjcf/g1_29dof_rev_1_0.xml")
-
+        if (self.target_type in (pipeline_utils.TargetType.UNITREE_G1, pipeline_utils.TargetType.UNITREE_H1)):
+            self.robot_builder = create_robot_builder(
+                pipeline_utils.get_target_str_from_type(self.target_type),
+                retargeter_config.get("robot_model"))
             self.human_robot_scaler = HumanToRobotScaler(
                 skeleton, retargeter_config['model_height'], io_utils.get_config_file(retargeter_config['human_robot_scaler_config']))
 
@@ -102,7 +153,10 @@ class NewtonPipeline:
                 self.mapped_joints.index("LeftFoot"),
                 self.mapped_joints.index("RightFoot")]
 
-            self.feet_stabilizer = FeetStabilizer(io_utils.get_config_file(retargeter_config['feet_stabilizer_config']))
+            self.feet_stabilizer = None
+            feet_stabilizer_config = retargeter_config.get('feet_stabilizer_config', None)
+            if self.post_processing_enabled and feet_stabilizer_config:
+                self.feet_stabilizer = FeetStabilizer(io_utils.get_config_file(feet_stabilizer_config))
             self.joint_limit_clamper = JointLimitClamper(self.ik_model)
 
             self.initialization_pose = None
@@ -184,11 +238,12 @@ class NewtonPipeline:
         print(f"[INFO]\t  IK Solver Iterations: {self.ik_iterations}")
         print(f"[INFO]\t  Joint Limit Objective Weight: {self.joint_limit_weight}")
         print(f"[INFO]\t  Smooth Joint Filter Objective Weight: {self.smooth_joint_filter_weight}")
+        print(f"[INFO]\t  Output Smoothing Window: {self.output_smoothing_window}")
 
         model = self._build_model(num_envs)
         state = model.state()
 
-        if self.post_processing_enabled:
+        if self.post_processing_enabled and self.feet_stabilizer is not None:
             self.feet_stabilizer.setup_num_envs(num_envs)
             env_feet_tx = np.empty((num_envs, len(self.feet_effector_indices), 7), dtype=np.float32)
 
@@ -253,7 +308,7 @@ class NewtonPipeline:
                 single_step()
 
             data = None
-            if self.post_processing_enabled:
+            if self.post_processing_enabled and self.feet_stabilizer is not None:
                 self.feet_stabilizer.reset_state(joint_q)
 
                 for env in range(num_envs):
@@ -276,9 +331,14 @@ class NewtonPipeline:
             #end_time = time.time()
             #print(f"Time taken for frame {frame}: {end_time - start_time} seconds")
 
-        return [
-            CSVAnimationBuffer.create_from_raw_data(joint_q_data[i][num_frames_to_remove:], self.input_sample_rates[i])
-            for i in range(num_envs)]
+        retargeted_buffers = []
+        for i in range(num_envs):
+            motion_data = np.stack(joint_q_data[i][num_frames_to_remove:]).astype(np.float32)
+            motion_data = _smooth_motion_data(motion_data, self.output_smoothing_window)
+            retargeted_buffers.append(
+                CSVAnimationBuffer.create_from_raw_data(motion_data, self.input_sample_rates[i]))
+
+        return retargeted_buffers
 
     def _build_model(self, num_envs: int):
         builder = newton.ModelBuilder()

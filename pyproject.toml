@@ -28,7 +28,17 @@ include = ["soma_retargeter*"]
 exclude = ["app*", "assets*", "submodules*"]
 
 [tool.setuptools.package-data]
-soma_retargeter = ["configs/**/*.json", "configs/**/*.bvh", "configs/**/*.usd"]
+soma_retargeter = [
+    "configs/**/*.json",
+    "configs/**/*.bvh",
+    "configs/**/*.usd",
+    "configs/**/*.urdf",
+    "configs/**/*.xml",
+    "configs/**/*.dae",
+    "configs/**/*.DAE",
+    "configs/**/*.stl",
+    "configs/**/*.STL",
+]
 
 [tool.setuptools.dynamic]
 version = { attr = "soma_retargeter.__version__" }

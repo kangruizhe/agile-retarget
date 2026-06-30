@@ -3,6 +3,7 @@
 
 import csv
 from dataclasses import dataclass
+import xml.etree.ElementTree as ET
 from typing import Protocol, ClassVar, List
 
 import numpy as np
@@ -10,6 +11,7 @@ import warp as wp
 
 from scipy.spatial.transform import Rotation as R
 from soma_retargeter.robotics.csv_animation_buffer import CSVAnimationBuffer
+import soma_retargeter.utils.io_utils as io_utils
 
 
 class RobotCSVConfig(Protocol):
@@ -81,6 +83,64 @@ class UnitreeG129DOF_CSVConfig:
         row.extend(np.rad2deg(anim_row[7:]))
 
         return row
+
+
+@dataclass
+class URDFRobotCSVConfig:
+    name: str
+    joint_names: List[str]
+
+    @property
+    def csv_header(self) -> List[str]:
+        return [
+            "Frame",
+            "root_translateX", "root_translateY", "root_translateZ",
+            "root_rotateX", "root_rotateY", "root_rotateZ",
+            *self.joint_names,
+        ]
+
+    def to_anim_frame(self, csv_row: np.ndarray) -> np.ndarray:
+        num_joint_dofs = csv_row.shape[0] - 1
+        anim_row = np.zeros(num_joint_dofs + 1, dtype=np.float32)
+
+        anim_row[0:3] = csv_row[1:4] * 0.01
+        euler = np.deg2rad(csv_row[4:7])
+        anim_row[3:7] = wp.quat_rpy(euler[0], euler[1], euler[2])
+        anim_row[7:] = np.deg2rad(csv_row[7:])
+
+        return anim_row
+
+    def to_csv_row(self, frame_idx: int, anim_row: np.ndarray) -> List[float]:
+        t = wp.vec3(*anim_row[0:3]) * 100.0
+        q = wp.quat(*anim_row[3:7])
+        euler = R.from_quat([q[0], q[1], q[2], q[3]]).as_euler("xyz", degrees=True)
+
+        row = [frame_idx, t[0], t[1], t[2], euler[0], euler[1], euler[2]]
+        row.extend(np.rad2deg(anim_row[7:]))
+
+        return row
+
+
+def get_movable_joint_names_from_urdf(urdf_path: str) -> List[str]:
+    root = ET.parse(urdf_path).getroot()
+    return [
+        joint.attrib["name"]
+        for joint in root.findall("joint")
+        if joint.attrib.get("type") not in ("fixed", None)
+    ]
+
+
+def get_csv_config_for_target(target: str) -> RobotCSVConfig:
+    if target == "unitree_g1":
+        return UnitreeG129DOF_CSVConfig()
+    if target == "unitree_h1":
+        urdf_path = io_utils.get_config_file("unitree_h1", "h1_with_hand.urdf")
+        return URDFRobotCSVConfig(
+            name="unitree_h1",
+            joint_names=get_movable_joint_names_from_urdf(str(urdf_path)),
+        )
+
+    raise ValueError(f"[ERROR]: Unknown CSV target [{target}].")
 
 
 def load_csv(file_path: str, fps: float = 120.0, csv_config: RobotCSVConfig = UnitreeG129DOF_CSVConfig()) -> CSVAnimationBuffer:
