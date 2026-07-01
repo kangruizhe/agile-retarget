@@ -1,0 +1,37 @@
+{
+    "robot_type": "unitree_h1",
+    "robot_model": {
+        "format": "urdf",
+        "path": "unitree_h1/h1_with_hand.urdf",
+        "floating": true,
+        "collapse_fixed_joints": false,
+        "hide_visuals": true,
+        "parse_visuals_as_colliders": false
+    },
+    "ik_iterations": 20,
+    "joint_limit_weight": 10.0,
+
+    "effectors": {
+        "pelvis": [30.0, 6.0],
+        "left_hip_roll_link": [1.5, 0.1],
+        "left_knee_link": [1.0, 0.3],
+        "left_ankle_link": [10.0, 0.35],
+        "right_hip_roll_link": [1.5, 0.1],
+        "right_knee_link": [1.0, 0.3],
+        "right_ankle_link": [10.0, 0.35]
+    },
+
+    "ik_root": 0,
+    "ik_limbs": {
+        "left_leg": {
+            "effectors": [1, 2, 3],
+            "hint_reference": 3,
+            "hint_offset": [0.25, 0.0, 0.25]
+        },
+        "right_leg": {
+            "effectors": [4, 5, 6],
+            "hint_reference": 6,
+            "hint_offset": [0.25, 0.0, 0.25]
+        }
+    }
+}

@@ -11,14 +11,14 @@
     "num_initialization_frames": 10,
     "num_stabilization_frames": 5,
     "human_robot_scaler_config": "unitree_h1/soma_to_h1_scaler_config_rest_aligned.json",
-    "feet_stabilizer_config": "",
+    "feet_stabilizer_config": "unitree_h1/h1_feet_stabilizer_config.json",
     "model_height": 1.80,
 
     "ik_iterations": 24,
     "joint_limit_weight": 10.0,
     "smooth_joint_filter_weight": 5.5,
     "collision_weight": 0.0,
-    "enable_post_processing": false,
+    "enable_post_processing": true,
     "output_smoothing_window": 7,
 
     "smooth_joint_filter_objective_body_masks": {

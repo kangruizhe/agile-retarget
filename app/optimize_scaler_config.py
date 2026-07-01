@@ -231,9 +231,28 @@ def compute_position_loss(
     diff = pred_t - targ_t
     wp.atomic_add(loss, 0, wp.dot(diff, diff))
 
-def optimize_scaler(config_file, bvh_file, retargeter_config_file=None, iterations=100, learning_rate=0.01, facing_direction="Maya", output_file=None):
+def optimize_scaler(
+    config_file,
+    bvh_file,
+    retargeter_config_file=None,
+    iterations=100,
+    learning_rate=0.01,
+    facing_direction="Maya",
+    output_file=None,
+    offset_lr_scale=0.02,
+    phase2_patience=30,
+):
     print(f"[INFO] Loading scaler config: {config_file}")
     config = io_utils.load_json(config_file)
+    retargeter_config = None
+    if retargeter_config_file:
+        retargeter_config = io_utils.load_json(retargeter_config_file)
+    model_height = (
+        retargeter_config.get('model_height')
+        if retargeter_config is not None and retargeter_config.get('model_height') is not None
+        else config.get('model_height', 1.70)
+    )
+    print(f"[INFO] Using model_height={model_height:.3f} for scaler optimization.")
     
     # Load BVH
     print(f"[INFO] Loading target BVH: {bvh_file}")
@@ -243,13 +262,12 @@ def optimize_scaler(config_file, bvh_file, retargeter_config_file=None, iteratio
     skeleton_instance.set_local_transforms(anim.get_local_transforms(0)) # Use first frame
     
     # Initialize scaler to get mapping info
-    scaler = HumanToRobotScaler(skeleton, config['model_height'] if 'model_height' in config else 1.70, config_file)
+    scaler = HumanToRobotScaler(skeleton, model_height, config_file)
     
     # Check mapped joints and create a gradient mask
     mask_np = np.ones(len(scaler.mapped_joints), dtype=np.float32)
-    if retargeter_config_file:
+    if retargeter_config is not None:
         print(f"[INFO] Using retargeter config to mask non-mapped joints: {retargeter_config_file}")
-        retargeter_config = io_utils.load_json(retargeter_config_file)
         ik_map_joints = retargeter_config.get('ik_map', {}).keys()
         for i, joint_name in enumerate(scaler.mapped_joints):
             if joint_name not in ik_map_joints:
@@ -303,7 +321,7 @@ def optimize_scaler(config_file, bvh_file, retargeter_config_file=None, iteratio
     # 3. Define target effectors from the Robot's Rest Pose
     target_effectors_np = scaler.compute_effectors_from_skeleton(skeleton_instance, scale_animation=True)
     
-    if retargeter_config_file:
+    if retargeter_config is not None:
         print("[INFO] Extracting actual robot rest pose to use as optimization targets...")
         pipeline = NewtonPipeline(skeleton, robot_type=config.get('robot_type', 'unitree_g1'), retarget_config=retargeter_config)
         model = pipeline.ik_model
@@ -398,7 +416,11 @@ def optimize_scaler(config_file, bvh_file, retargeter_config_file=None, iteratio
 
     # Phase 2: Optimize offset translations via per-joint position loss
     print(f"[INFO] Phase 2 – Offset translation optimization for {iterations} iterations...")
-    lr_offset = learning_rate * 0.1   # smaller LR for offsets
+    lr_offset = learning_rate * offset_lr_scale   # smaller LR for offsets
+    print(f"[INFO] Phase 2 offset learning rate: {lr_offset:.6f}")
+    best_phase2_loss = None
+    best_phase2_offsets = mapped_joint_offsets.numpy().copy()
+    phase2_no_improve = 0
     for i in range(iterations):
         tape = wp.Tape()
         loss = wp.zeros(1, dtype=wp.float32, requires_grad=True)
@@ -418,17 +440,37 @@ def optimize_scaler(config_file, bvh_file, retargeter_config_file=None, iteratio
                 inputs=[wp_effectors, target_effectors, wp_pred_root, wp_targ_root, update_mask, loss])
         tape.backward(loss)
         l_val = loss.numpy()[0]
+        if best_phase2_loss is None or l_val < best_phase2_loss:
+            best_phase2_loss = l_val
+            best_phase2_offsets = mapped_joint_offsets.numpy().copy()
+            phase2_no_improve = 0
+        else:
+            phase2_no_improve += 1
         if i % 10 == 0 or i == iterations - 1:
             print(f"[Phase2] Iter {i:4d} | Position Loss: {l_val:10.6f}")
+        if phase2_patience > 0 and phase2_no_improve >= phase2_patience:
+            print(
+                f"[INFO] Phase 2 early stop at iter {i}; "
+                f"best Position Loss: {best_phase2_loss:10.6f}"
+            )
+            break
         wp.launch(step_kernel_vec3_offsets, dim=len(scaler.mapped_joint_indices),
             inputs=[mapped_joint_offsets, tape.gradients[mapped_joint_offsets], update_mask, lr_offset])
         tape.zero()
+
+    if best_phase2_loss is not None:
+        mapped_joint_offsets = wp.array(best_phase2_offsets, dtype=wp.transform, requires_grad=True)
+        print(f"[INFO] Restored best Phase2 offsets with Position Loss: {best_phase2_loss:10.6f}")
+        wp_effectors = wp.zeros(len(scaler.mapped_joint_indices), dtype=wp.transform, requires_grad=True)
+        wp.launch(kernel_compute_scaled_effectors, dim=1,
+            inputs=[len(scaler.mapped_joint_indices), wp_global_pose, scaler.mapped_joint_indices,
+                    mapped_joint_scales, mapped_joint_offsets, mapped_joint_rotation_modes, True],
+            outputs=[wp_effectors])
 
     print("[INFO] Optimization complete.")
     
     # Save optimized parameters back to config
     # HumanToRobotScaler applies a ratio on load, we must divide it out to save properly.
-    model_height = config.get('model_height', 1.70)
     human_height_assump = config.get('human_height_assumption', 1.80)
     ratio = model_height / human_height_assump
     
@@ -551,6 +593,8 @@ if __name__ == "__main__":
     parser.add_argument("--facing_direction", type=str, default="Maya", choices=["Maya", "Mujoco"], help="Source facing direction used by the runtime converter.")
     parser.add_argument("--output", type=str, default=None, help="Optional output path. Defaults to *_optimized.json or *_rest_aligned.json.")
     parser.add_argument("--rest_align_offsets", action="store_true", help="Generate offset rotations/translations from SOMA rest pose to robot rest pose, without gradient optimization.")
+    parser.add_argument("--offset_lr_scale", type=float, default=0.02, help="Phase 2 offset LR multiplier relative to --lr.")
+    parser.add_argument("--phase2_patience", type=int, default=30, help="Stop Phase 2 after this many non-improving iterations. Use 0 to disable.")
     
     args = parser.parse_args()
     if args.rest_align_offsets:
@@ -568,4 +612,6 @@ if __name__ == "__main__":
             args.iters,
             args.lr,
             args.facing_direction,
-            args.output)
+            args.output,
+            args.offset_lr_scale,
+            args.phase2_patience)
